@@ -1,0 +1,9 @@
+# Embedded JRE runtime (binary)
+jre/
+
+# Decompiled output directories
+*-src/
+
+# Temporary test logs and text notes
+*.txt
+*.log
