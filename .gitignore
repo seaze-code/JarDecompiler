@@ -4,6 +4,7 @@ jre/
 # Decompiled output directories
 *-src/
 
-# Temporary test logs and text notes
+# Temporary test logs, AppCDS archives, and text notes
 *.txt
 *.log
+*.jsa

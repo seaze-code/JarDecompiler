@@ -199,9 +199,19 @@ namespace JarDecompiler
             }
         }
 
+        static string ResolveAppCdsArchive(string appDir)
+        {
+            string serverDir = Path.Combine(appDir, "jre", "bin", "server");
+            if (Directory.Exists(serverDir))
+            {
+                return Path.Combine(serverDir, "vineflower.jsa");
+            }
+            return Path.Combine(appDir, "vineflower.jsa");
+        }
+
         static bool ProcessJar(string jarPath, string javaExe, string vineflowerJar, int index, int total)
         {
-            jarPath = (jarPath ?? "").Trim('\"', '\'');
+            jarPath = (jarPath ?? "").Trim().Trim('\"', '\'');
             if (!File.Exists(jarPath))
             {
                 PrintColorLine(string.Format("[{0}/{1}] [ERROR] File not found: {2}", index, total, jarPath), ConsoleColor.Red);
@@ -227,48 +237,59 @@ namespace JarDecompiler
                 Directory.CreateDirectory(outDir);
             }
 
+            string appDir = AppDomain.CurrentDomain.BaseDirectory;
+            string jsaPath = ResolveAppCdsArchive(appDir);
+            string cdsFlags = File.Exists(jsaPath)
+                ? string.Format("-Xshare:auto -XX:SharedArchiveFile=\"{0}\" ", jsaPath)
+                : string.Format("-XX:ArchiveClassesAtExit=\"{0}\" ", jsaPath);
+
             int threads = System.Math.Max(2, System.Environment.ProcessorCount);
             string arguments = string.Format(
-                "-Xmx2G -jar \"{0}\" " +
+                "{0}" +
+                "-XX:TieredStopAtLevel=1 " +
+                "-XX:+UseParallelGC " +
+                "-Xms256M -Xmx4G " +
+                "-jar \"{1}\" " +
                 "--folder " +
                 "--decompile-generics=true " +
                 "--decompile-enums=true " +
                 "--decompile-finally=true " +
                 "--decompile-switch-expressions=true " +
+                "--decompile-preview=true " +
+                "--decompile-complex-constant-dynamic=true " +
+                "--pattern-matching=true " +
+                "--ternary-constant-simplification=true " +
+                "--simplify-stack=true " +
+                "--incorporate-returns=true " +
+                "--prettify-ifs=true " +
+                "--ensure-synchronized-monitors=true " +
+                "--try-loop-fix=true " +
+                "--force-jsr-inline=true " +
+                "--synthetic-not-set=true " +
+                "--verify-anonymous-classes=true " +
                 "--use-lvt-names=true " +
                 "--use-method-parameters=true " +
                 "--remove-bridge=true " +
                 "--remove-synthetic=true " +
+                "--remove-getclass=true " +
+                "--remove-empty-try-catch=true " +
                 "--hide-default-constructor=true " +
+                "--hide-empty-super=true " +
+                "--inline-simple-lambdas=true " +
+                "--override-annotation=true " +
                 "--resugar-idea-notnull=true " +
+                "--kt-enable=true " +
+                "--kt-collapse-string-concat=true " +
                 "--ascii-strings=false " +
-                "--thread-count={1} " +
-                "\"{2}\" \"{3}\"",
+                "--indent-string=\"    \" " +
+                "--thread-count={2} " +
+                "\"{3}\" \"{4}\"",
+                cdsFlags,
                 vineflowerJar,
                 threads,
                 fi.FullName,
                 outDir
             );
-
-            int totalClasses = 0;
-            try
-            {
-                using (System.IO.Compression.ZipArchive archive = System.IO.Compression.ZipFile.OpenRead(fi.FullName))
-                {
-                    foreach (System.IO.Compression.ZipArchiveEntry entry in archive.Entries)
-                    {
-                        if (entry.FullName.EndsWith(".class", System.StringComparison.OrdinalIgnoreCase) &&
-                            entry.FullName.IndexOf('$') < 0)
-                        {
-                            totalClasses++;
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                totalClasses = 0;
-            }
 
             Stopwatch sw = Stopwatch.StartNew();
 
@@ -284,12 +305,12 @@ namespace JarDecompiler
                 CreateNoWindow = true
             };
 
-            object syncLock = new object();
+            object errLock = new object();
             string phase = "Starting JVM...";
             string currentClass = "";
             int doneClasses = 0;
+            int totalClasses = 0;
             System.Collections.Generic.List<string> errLines = new System.Collections.Generic.List<string>();
-            System.Collections.Generic.List<string> warnLines = new System.Collections.Generic.List<string>();
 
             try
             {
@@ -300,58 +321,63 @@ namespace JarDecompiler
                     proc.StartInfo = psi;
                     proc.OutputDataReceived += (sender, e) =>
                     {
-                        if (e.Data == null)
+                        string data = e.Data;
+                        if (data == null)
                         {
                             outDone.Set();
                             return;
                         }
-                        string line = e.Data.Trim();
-                        if (line.Length == 0) return;
+                        if (data.Length == 0) return;
 
-                        lock (syncLock)
+                        // Fast lock-free path using Ordinal comparisons
+                        if (data.EndsWith("... done", StringComparison.Ordinal))
                         {
-                            if (line.IndexOf("Scanning ", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                            Interlocked.Increment(ref doneClasses);
+                            return;
+                        }
+
+                        int decompIdx = data.IndexOf("Decompiling class ", StringComparison.Ordinal);
+                        if (decompIdx >= 0)
+                        {
+                            phase = "Decompiling";
+                            currentClass = data.Substring(decompIdx + 18).Trim().Replace('/', '.');
+                            return;
+                        }
+
+                        if (data.IndexOf("Loading Class:", StringComparison.Ordinal) >= 0)
+                        {
+                            phase = "Loading classes...";
+                            return;
+                        }
+
+                        if (data.IndexOf("Scanning ", StringComparison.Ordinal) >= 0)
+                        {
+                            phase = "Scanning...";
+                            return;
+                        }
+
+                        if (data.StartsWith("ERROR:", StringComparison.OrdinalIgnoreCase) ||
+                            data.StartsWith("SEVERE:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            lock (errLock)
                             {
-                                phase = "Scanning...";
-                            }
-                            else if (line.IndexOf("Loading Class:", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                phase = "Loading...";
-                            }
-                            else if (line.IndexOf("Decompiling class ", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                phase = "Decompiling";
-                                int idx = line.IndexOf("Decompiling class ", System.StringComparison.OrdinalIgnoreCase);
-                                string cls = line.Substring(idx + 18).Trim().Replace('/', '.');
-                                currentClass = cls;
-                            }
-                            else if (line.IndexOf("... done", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                doneClasses++;
-                            }
-                            else if (line.StartsWith("ERROR:", System.StringComparison.OrdinalIgnoreCase) ||
-                                     line.StartsWith("SEVERE:", System.StringComparison.OrdinalIgnoreCase))
-                            {
-                                if (errLines.Count < 50) errLines.Add(line);
-                            }
-                            else if (line.StartsWith("WARN:", System.StringComparison.OrdinalIgnoreCase))
-                            {
-                                if (warnLines.Count < 20) warnLines.Add(line);
+                                if (errLines.Count < 50) errLines.Add(data.Trim());
                             }
                         }
                     };
 
                     proc.ErrorDataReceived += (sender, e) =>
                     {
-                        if (e.Data == null)
+                        string data = e.Data;
+                        if (data == null)
                         {
                             errDone.Set();
                             return;
                         }
-                        string line = e.Data.Trim();
+                        string line = data.Trim();
                         if (line.Length == 0) return;
 
-                        lock (syncLock)
+                        lock (errLock)
                         {
                             if (errLines.Count < 100) errLines.Add(line);
                         }
@@ -367,34 +393,65 @@ namespace JarDecompiler
                     proc.BeginOutputReadLine();
                     proc.BeginErrorReadLine();
 
+                    // Count top-level .class entries in parallel while JVM starts up (zero wall-clock delay)
+                    string jarFullName = fi.FullName;
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        try
+                        {
+                            int cnt = 0;
+                            using (System.IO.Compression.ZipArchive archive = System.IO.Compression.ZipFile.OpenRead(jarFullName))
+                            {
+                                foreach (System.IO.Compression.ZipArchiveEntry entry in archive.Entries)
+                                {
+                                    string name = entry.FullName;
+                                    if (name.EndsWith(".class", StringComparison.OrdinalIgnoreCase) &&
+                                        name.IndexOf('$') < 0 &&
+                                        !name.Equals("module-info.class", StringComparison.OrdinalIgnoreCase) &&
+                                        !name.EndsWith("/module-info.class", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        cnt++;
+                                    }
+                                }
+                            }
+                            Interlocked.Exchange(ref totalClasses, cnt);
+                        }
+                        catch { }
+                    });
+
                     char[] spinner = new char[] { '|', '/', '-', '\\' };
                     int spinIdx = 0;
                     bool interactive = !Console.IsOutputRedirected;
-
-                    if (!interactive)
+                    int maxWidth = 79;
+                    if (interactive)
+                    {
+                        try { maxWidth = System.Math.Max(20, Console.WindowWidth - 1); } catch { maxWidth = 79; }
+                    }
+                    else
                     {
                         PrintColorLine("  Processing...", ConsoleColor.Yellow);
                     }
 
-                    while (!proc.WaitForExit(100))
+                    string lastStatus = "";
+                    while (!proc.WaitForExit(50))
                     {
                         if (!interactive) continue;
 
-                        string snapPhase;
-                        string snapClass;
-                        int snapDone;
-                        lock (syncLock)
+                        if ((spinIdx & 15) == 0)
                         {
-                            snapPhase = phase;
-                            snapClass = currentClass;
-                            snapDone = doneClasses;
+                            try { maxWidth = System.Math.Max(20, Console.WindowWidth - 1); } catch { maxWidth = 79; }
                         }
 
+                        string snapPhase = phase;
+                        string snapClass = currentClass;
+                        int snapDone = Volatile.Read(ref doneClasses);
+                        int snapTotal = Volatile.Read(ref totalClasses);
+
                         string progressPart;
-                        if (totalClasses > 0 && snapDone > 0)
+                        if (snapTotal > 0 && snapDone > 0)
                         {
-                            int pct = System.Math.Min(99, (snapDone * 100) / totalClasses);
-                            progressPart = string.Format("{0} {1}/{2} ({3}%)", snapPhase, snapDone, totalClasses, pct);
+                            int pct = System.Math.Min(99, (snapDone * 100) / snapTotal);
+                            progressPart = string.Format("{0} {1}/{2} ({3}%)", snapPhase, snapDone, snapTotal, pct);
                         }
                         else if (snapDone > 0)
                         {
@@ -405,14 +462,12 @@ namespace JarDecompiler
                             progressPart = snapPhase;
                         }
 
-                        string status = string.Format("  [{0}] {1} | {2:N1}s", spinner[spinIdx++ % spinner.Length], progressPart, sw.Elapsed.TotalSeconds);
+                        string status = string.Format("  [{0}] {1} | {2:N1}s", spinner[spinIdx++ & 3], progressPart, sw.Elapsed.TotalSeconds);
                         if (!string.IsNullOrEmpty(snapClass))
                         {
                             status += " | " + snapClass;
                         }
 
-                        int maxWidth = 79;
-                        try { maxWidth = System.Math.Max(20, Console.WindowWidth - 1); } catch { maxWidth = 79; }
                         if (status.Length > maxWidth)
                         {
                             status = status.Substring(0, maxWidth - 3) + "...";
@@ -422,7 +477,11 @@ namespace JarDecompiler
                             status = status.PadRight(maxWidth);
                         }
 
-                        Console.Write("\r" + status);
+                        if (!string.Equals(status, lastStatus, StringComparison.Ordinal))
+                        {
+                            Console.Write("\r" + status);
+                            lastStatus = status;
+                        }
                     }
 
                     proc.WaitForExit();
@@ -432,9 +491,7 @@ namespace JarDecompiler
 
                     if (interactive)
                     {
-                        int clearWidth = 79;
-                        try { clearWidth = System.Math.Max(20, Console.WindowWidth - 1); } catch { clearWidth = 79; }
-                        Console.Write("\r" + new string(' ', clearWidth) + "\r");
+                        Console.Write("\r" + new string(' ', maxWidth) + "\r");
                     }
 
                     PrintColor("  Processing... ", ConsoleColor.Yellow);
@@ -442,19 +499,31 @@ namespace JarDecompiler
                     if (proc.ExitCode == 0)
                     {
                         PrintColorLine("OK", ConsoleColor.Green);
-                        int javaCount = Directory.Exists(outDir)
-                            ? Directory.GetFiles(outDir, "*.java", SearchOption.AllDirectories).Length
-                            : 0;
+                        int sourceCount = 0;
+                        if (Directory.Exists(outDir))
+                        {
+                            foreach (string file in Directory.EnumerateFiles(outDir, "*.*", SearchOption.AllDirectories))
+                            {
+                                if (file.EndsWith(".java", StringComparison.OrdinalIgnoreCase) ||
+                                    file.EndsWith(".kt", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    sourceCount++;
+                                }
+                            }
+                        }
                         PrintColorLine(string.Format("  Time:   {0:N2}s", sw.Elapsed.TotalSeconds), ConsoleColor.DarkGray);
-                        PrintColorLine(string.Format("  Source: {0} .java files generated", javaCount), ConsoleColor.White);
+                        PrintColorLine(string.Format("  Source: {0} source files generated", sourceCount), ConsoleColor.White);
                         return true;
                     }
                     else
                     {
                         PrintColorLine(string.Format("FAILED (exit code {0})", proc.ExitCode), ConsoleColor.Red);
-                        foreach (string err in errLines)
+                        lock (errLock)
                         {
-                            PrintColorLine("  " + err, ConsoleColor.Red);
+                            foreach (string err in errLines)
+                            {
+                                PrintColorLine("  " + err, ConsoleColor.Red);
+                            }
                         }
                         return false;
                     }
