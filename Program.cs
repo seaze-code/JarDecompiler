@@ -209,6 +209,18 @@ namespace JarDecompiler
             return Path.Combine(appDir, "vineflower.jsa");
         }
 
+        static string FormatShortClass(string rawClass)
+        {
+            if (string.IsNullOrEmpty(rawClass)) return "";
+            string clean = rawClass.Trim();
+            int slash = clean.LastIndexOf('/');
+            if (slash >= 0 && slash + 1 < clean.Length)
+            {
+                return clean.Substring(slash + 1);
+            }
+            return clean;
+        }
+
         static bool ProcessJar(string jarPath, string javaExe, string vineflowerJar, int index, int total)
         {
             jarPath = (jarPath ?? "").Trim().Trim('\"', '\'');
@@ -306,10 +318,18 @@ namespace JarDecompiler
             };
 
             object errLock = new object();
-            string phase = "Starting JVM...";
+            // Stage: 0 = Starting JVM, 1 = Scanning runtime, 2 = Loading JAR classes, 3 = Preprocessing, 4 = Decompiling
+            int stage = 0;
+            int scannedModules = 0;
+            int loadedClasses = 0;
+            int preprocStarted = 0;
+            int preprocDone = 0;
+            int decompStarted = 0;
+            int decompDone = 0;
+            int zipTopClasses = 0;
+            int zipAllClasses = 0;
+            int warnCount = 0;
             string currentClass = "";
-            int doneClasses = 0;
-            int totalClasses = 0;
             System.Collections.Generic.List<string> errLines = new System.Collections.Generic.List<string>();
 
             try
@@ -329,30 +349,72 @@ namespace JarDecompiler
                         }
                         if (data.Length == 0) return;
 
-                        // Fast lock-free path using Ordinal comparisons
+                        // 1. "... done" completion event (occurs once per class in Stage 3 Preprocessing, and once per class in Stage 4 Decompiling)
                         if (data.EndsWith("... done", StringComparison.Ordinal))
                         {
-                            Interlocked.Increment(ref doneClasses);
+                            int curStage = Volatile.Read(ref stage);
+                            if (curStage >= 4)
+                            {
+                                Interlocked.Increment(ref decompDone);
+                            }
+                            else if (curStage == 3)
+                            {
+                                Interlocked.Increment(ref preprocDone);
+                            }
                             return;
                         }
 
+                        // 2. Stage 4: "INFO:  Decompiling class <name>"
                         int decompIdx = data.IndexOf("Decompiling class ", StringComparison.Ordinal);
                         if (decompIdx >= 0)
                         {
-                            phase = "Decompiling";
-                            currentClass = data.Substring(decompIdx + 18).Trim().Replace('/', '.');
+                            Volatile.Write(ref stage, 4);
+                            Interlocked.Increment(ref decompStarted);
+                            currentClass = FormatShortClass(data.Substring(decompIdx + 18));
                             return;
                         }
 
+                        // 3. Stage 3: "INFO:  Preprocessing class <name>"
+                        int preIdx = data.IndexOf("Preprocessing class ", StringComparison.Ordinal);
+                        if (preIdx >= 0)
+                        {
+                            if (Volatile.Read(ref stage) < 3)
+                            {
+                                Volatile.Write(ref stage, 3);
+                            }
+                            Interlocked.Increment(ref preprocStarted);
+                            currentClass = FormatShortClass(data.Substring(preIdx + 20));
+                            return;
+                        }
+
+                        // 4. Stage 2: "INFO:  Loading Class: <name> from archive ..." (only before Stage 3; ignore lazy runtime loads during Stage 3/4)
                         if (data.IndexOf("Loading Class:", StringComparison.Ordinal) >= 0)
                         {
-                            phase = "Loading classes...";
+                            if (Volatile.Read(ref stage) < 3 && data.IndexOf(" from archive ", StringComparison.Ordinal) >= 0)
+                            {
+                                Volatile.Write(ref stage, 2);
+                                Interlocked.Increment(ref loadedClasses);
+                            }
                             return;
                         }
 
-                        if (data.IndexOf("Scanning ", StringComparison.Ordinal) >= 0)
+                        // 5. Stage 1: "INFO:  Scanning classes from ..."
+                        if (data.IndexOf("Scanning classes from ", StringComparison.Ordinal) >= 0)
                         {
-                            phase = "Scanning...";
+                            if (Volatile.Read(ref stage) < 1)
+                            {
+                                Volatile.Write(ref stage, 1);
+                            }
+                            if (data.IndexOf(" module ", StringComparison.Ordinal) >= 0)
+                            {
+                                Interlocked.Increment(ref scannedModules);
+                            }
+                            return;
+                        }
+
+                        if (data.StartsWith("WARN:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Interlocked.Increment(ref warnCount);
                             return;
                         }
 
@@ -385,7 +447,7 @@ namespace JarDecompiler
 
                     if (!proc.Start())
                     {
-                        PrintColor("  Processing... ", ConsoleColor.Yellow);
+                        PrintColor("  Status: ", ConsoleColor.Yellow);
                         PrintColorLine("FAILED (could not start java process)", ConsoleColor.Red);
                         return false;
                     }
@@ -393,28 +455,33 @@ namespace JarDecompiler
                     proc.BeginOutputReadLine();
                     proc.BeginErrorReadLine();
 
-                    // Count top-level .class entries in parallel while JVM starts up (zero wall-clock delay)
+                    // Count total & top-level .class entries in parallel while JVM boots
                     string jarFullName = fi.FullName;
                     ThreadPool.QueueUserWorkItem(_ =>
                     {
                         try
                         {
-                            int cnt = 0;
+                            int topCnt = 0;
+                            int allCnt = 0;
                             using (System.IO.Compression.ZipArchive archive = System.IO.Compression.ZipFile.OpenRead(jarFullName))
                             {
                                 foreach (System.IO.Compression.ZipArchiveEntry entry in archive.Entries)
                                 {
                                     string name = entry.FullName;
-                                    if (name.EndsWith(".class", StringComparison.OrdinalIgnoreCase) &&
-                                        name.IndexOf('$') < 0 &&
-                                        !name.Equals("module-info.class", StringComparison.OrdinalIgnoreCase) &&
-                                        !name.EndsWith("/module-info.class", StringComparison.OrdinalIgnoreCase))
+                                    if (name.EndsWith(".class", StringComparison.OrdinalIgnoreCase))
                                     {
-                                        cnt++;
+                                        allCnt++;
+                                        if (name.IndexOf('$') < 0 &&
+                                            !name.Equals("module-info.class", StringComparison.OrdinalIgnoreCase) &&
+                                            !name.EndsWith("/module-info.class", StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            topCnt++;
+                                        }
                                     }
                                 }
                             }
-                            Interlocked.Exchange(ref totalClasses, cnt);
+                            Interlocked.Exchange(ref zipAllClasses, allCnt);
+                            Interlocked.Exchange(ref zipTopClasses, topCnt);
                         }
                         catch { }
                     });
@@ -442,28 +509,70 @@ namespace JarDecompiler
                             try { maxWidth = System.Math.Max(20, Console.WindowWidth - 1); } catch { maxWidth = 79; }
                         }
 
-                        string snapPhase = phase;
+                        int curStage = Volatile.Read(ref stage);
+                        int curModules = Volatile.Read(ref scannedModules);
+                        int curLoaded = Volatile.Read(ref loadedClasses);
+                        int curPreStarted = Volatile.Read(ref preprocStarted);
+                        int curPreDone = Volatile.Read(ref preprocDone);
+                        int curDecDone = Volatile.Read(ref decompDone);
+                        int curZipTop = Volatile.Read(ref zipTopClasses);
+                        int curZipAll = Volatile.Read(ref zipAllClasses);
                         string snapClass = currentClass;
-                        int snapDone = Volatile.Read(ref doneClasses);
-                        int snapTotal = Volatile.Read(ref totalClasses);
 
-                        string progressPart;
-                        if (snapTotal > 0 && snapDone > 0)
+                        string stageText;
+                        if (curStage == 0)
                         {
-                            int pct = System.Math.Min(99, (snapDone * 100) / snapTotal);
-                            progressPart = string.Format("{0} {1}/{2} ({3}%)", snapPhase, snapDone, snapTotal, pct);
+                            stageText = "[1/4] Starting JVM...";
                         }
-                        else if (snapDone > 0)
+                        else if (curStage == 1)
                         {
-                            progressPart = string.Format("{0} {1} classes", snapPhase, snapDone);
+                            stageText = curModules > 0
+                                ? string.Format("[1/4] Scanning runtime ({0} modules)...", curModules)
+                                : "[1/4] Scanning runtime...";
+                        }
+                        else if (curStage == 2)
+                        {
+                            if (curZipAll > 0)
+                            {
+                                int pct = System.Math.Min(100, (curLoaded * 100) / curZipAll);
+                                stageText = string.Format("[2/4] Loading JAR {0}/{1} ({2}%)", curLoaded, curZipAll, pct);
+                            }
+                            else
+                            {
+                                stageText = string.Format("[2/4] Loading JAR ({0} classes)...", curLoaded);
+                            }
+                        }
+                        else if (curStage == 3)
+                        {
+                            int targetTop = System.Math.Max(curZipTop, curPreStarted);
+                            if (targetTop > 0)
+                            {
+                                int pct = System.Math.Min(100, (curPreDone * 100) / targetTop);
+                                stageText = string.Format("[3/4] Preprocessing {0}/{1} ({2}%)", curPreDone, targetTop, pct);
+                            }
+                            else
+                            {
+                                stageText = string.Format("[3/4] Preprocessing {0} classes...", curPreDone);
+                            }
                         }
                         else
                         {
-                            progressPart = snapPhase;
+                            // In Stage 4, curPreStarted is the exact number of classes Vineflower preprocessed for decompilation
+                            int exactTotal = curPreStarted > 0 ? curPreStarted : curZipTop;
+                            if (exactTotal > 0)
+                            {
+                                int clampedDone = System.Math.Min(curDecDone, exactTotal);
+                                int pct = System.Math.Min(99, (clampedDone * 100) / exactTotal);
+                                stageText = string.Format("[4/4] Decompiling {0}/{1} ({2}%)", clampedDone, exactTotal, pct);
+                            }
+                            else
+                            {
+                                stageText = string.Format("[4/4] Decompiling {0} classes...", curDecDone);
+                            }
                         }
 
-                        string status = string.Format("  [{0}] {1} | {2:N1}s", spinner[spinIdx++ & 3], progressPart, sw.Elapsed.TotalSeconds);
-                        if (!string.IsNullOrEmpty(snapClass))
+                        string status = string.Format("  [{0}] {1} | {2:N1}s", spinner[spinIdx++ & 3], stageText, sw.Elapsed.TotalSeconds);
+                        if (curStage >= 3 && !string.IsNullOrEmpty(snapClass))
                         {
                             status += " | " + snapClass;
                         }
@@ -494,11 +603,16 @@ namespace JarDecompiler
                         Console.Write("\r" + new string(' ', maxWidth) + "\r");
                     }
 
-                    PrintColor("  Processing... ", ConsoleColor.Yellow);
+                    PrintColor("  Status: ", ConsoleColor.Yellow);
 
                     if (proc.ExitCode == 0)
                     {
-                        PrintColorLine("OK", ConsoleColor.Green);
+                        int finalDone = Volatile.Read(ref decompDone);
+                        int finalTotal = Volatile.Read(ref preprocStarted);
+                        if (finalTotal <= 0) finalTotal = finalDone;
+
+                        PrintColorLine(string.Format("OK ({0}/{1} classes decompiled, 100%)", finalDone, finalTotal), ConsoleColor.Green);
+
                         int sourceCount = 0;
                         if (Directory.Exists(outDir))
                         {
@@ -511,8 +625,16 @@ namespace JarDecompiler
                                 }
                             }
                         }
-                        PrintColorLine(string.Format("  Time:   {0:N2}s", sw.Elapsed.TotalSeconds), ConsoleColor.DarkGray);
+
+                        double secs = System.Math.Max(0.01, sw.Elapsed.TotalSeconds);
+                        double rate = finalDone / secs;
+                        PrintColorLine(string.Format("  Time:   {0:N2}s ({1:N1} classes/s)", sw.Elapsed.TotalSeconds, rate), ConsoleColor.DarkGray);
                         PrintColorLine(string.Format("  Source: {0} source files generated", sourceCount), ConsoleColor.White);
+                        int finalWarns = Volatile.Read(ref warnCount);
+                        if (finalWarns > 0)
+                        {
+                            PrintColorLine(string.Format("  Notes:  {0} decompiler warning(s)", finalWarns), ConsoleColor.DarkYellow);
+                        }
                         return true;
                     }
                     else
